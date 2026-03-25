@@ -195,19 +195,19 @@
 
 
 	board-subtype-storage-type {
-		emmc {
-			board-subtype = <0x00001000>;
+		ufs {
+			board-subtype = <0x00004000>;
 		};
 
 		nand {
-			board-subtype = <0x00002000>;
+			board-subtype = <0x00008000>;
 		};
 
 		sdcard {
-			board-subtype = <0x00003000>;
+			board-subtype = <0x0000C000>;
 		};
 
-		ufs {
+		emmc {
 			board-subtype = <0x00000000>;
 		};
 	};
