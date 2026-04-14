@@ -1,0 +1,435 @@
+#!/usr/bin/env bash
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+#
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+#
+# =============================================================================
+# build-dtb-image.sh
+#
+# Description:
+#   Build a FAT-formatted FIT DTB image for Qualcomm ARM64 platforms.
+#
+#   This script is part of the qcom-dtb-metadata repository.  The ITS file
+#   (qcom-next-fitimage.its) and platform metadata DTS (qcom-metadata.dts)
+#   are read directly from the repository directory containing this script —
+#   no network access or repository cloning is required at build time.
+#
+#   The script produces a FIT DTB image (qclinux_fit.img) suitable for
+#   booting multiple Qualcomm platforms from a single DTB image, using the
+#   multi-DTB selection mechanism defined by qcom-dtb-metadata.
+#
+#   ─────────────────────────────────────────────────────────────────────────
+#   DTB Source Modes
+#   ─────────────────────────────────────────────────────────────────────────
+#
+#     (A) Kernel .deb mode (recommended / upstream-friendly)
+#         - Provide a Debian kernel package (.deb) as input.
+#         - The script extracts the .deb via `dpkg-deb -R` into a temp directory.
+#         - DTBs are located by probing the following paths in order:
+#             1. $DEB_DIR/usr/lib/linux-image-*/   (Debian standard — direct, no symlink)
+#             2. $DEB_DIR/usr/lib/firmware/*/device-tree  (Ubuntu compat, usrmerge layout)
+#             3. $DEB_DIR/lib/firmware/*/device-tree      (Ubuntu compat, legacy layout)
+#           Probing the Debian standard path first ensures correct operation on
+#           both Debian and Ubuntu regardless of whether the compat symlink exists.
+#         - The script assumes there is exactly ONE matching directory.
+#
+#     (B) DTB source directory mode (dev/kernel-tree mode)
+#         - Provide the DTB source directory directly (e.g. a kernel build tree):
+#             arch/arm64/boot/dts/qcom
+#
+#   ─────────────────────────────────────────────────────────────────────────
+#   Build Steps
+#   ─────────────────────────────────────────────────────────────────────────
+#     1. Set up a temporary staging directory with the ITS, compiled DTS,
+#        and all DTBs laid out as the ITS /incbin/ paths expect.
+#     2. Compile qcom-metadata.dts → qcom-metadata.dtb  (via dtc).
+#     3. Copy qcom-next-fitimage.its into the staging directory.
+#     4. Run mkimage to produce qclinux_fit.img  (-E -B 8).
+#        NOTE: The output filename is hardcoded in UEFI firmware:
+#              #define FIT_BINARY_FILE    L"\\qclinux_fit.img"
+#              #define COMBINED_DTB_FILE  L"\\combined-dtb.dtb"
+#              #define SECONDARY_DTB_FILE L"\\secondary-dtb.dtb"
+#     5. Pack qclinux_fit.img into a FAT image.
+#
+# Usage:
+#   sudo ./build-dtb-image.sh \
+#       (--kernel-deb <path/to/kernel.deb> | --dtb-src <path/to/dtb/dir>) \
+#       [--size <MB>] [--out <file>]
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# Arguments:
+#   --kernel-deb / -kernel-deb
+#              Path to a Debian kernel package (.deb). DTBs are taken from the
+#              extracted payload, probed in order:
+#                1. usr/lib/linux-image-*/        (Debian standard)
+#                2. usr/lib/firmware/*/device-tree (Ubuntu compat, usrmerge)
+#                3. lib/firmware/*/device-tree     (Ubuntu compat, legacy)
+#
+#   --dtb-src / -dtb-src
+#              Path to DTB source directory
+#              e.g., arch/arm64/boot/dts/qcom
+#
+#   --fit-image / -fit-image
+#              [Accepted for backward compatibility] FIT image mode is the
+#              default and only mode; this flag is a no-op.
+#
+#   --size / -size
+#              FAT image size in MB (integer > 0, default: 4)
+#
+#   --out / -out
+#              Output image filename (default: dtb.bin)
+#
+# Requirements / Assumptions:
+#   - Linux host with:
+#       * bash
+#       * mkfs.vfat
+#       * losetup
+#       * mount / umount
+#       * dd (status=progress support is nice but not required)
+#       * mountpoint
+#       * dtc
+#       * mkimage
+#       * dpkg-deb (only required for --kernel-deb mode)
+#   - This script must be run as root (no internal sudo calls).
+#
+# Notes:
+#   - The resulting FAT image contains qclinux_fit.img at its root.
+#   - The script installs a cleanup trap to:
+#       * unmount the image,
+#       * detach the loop device,
+#       * delete temporary files and directories.
+#
+# =============================================================================
+
+set -euo pipefail
+
+# Resolve the directory containing this script (the qcom-dtb-metadata root).
+# All metadata files (ITS, DTS) are read from this directory at runtime —
+# no cloning or network access is required.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Require running as root (needed for losetup, mkfs, mount, etc.)
+if [[ "${EUID}" -ne 0 ]]; then
+    echo "[ERROR] This script must be run as root (no internal sudo calls)." >&2
+    exit 1
+fi
+
+# ----------------------------- Defaults --------------------------------------
+
+DTB_BIN_SIZE=4         # Default FAT image size (MB)
+DTB_BIN="dtb.bin"      # Default output image filename
+
+DTB_SRC=""             # DTB source directory (resolved; required via one mode)
+
+KERNEL_DEB=""          # Optional: kernel .deb input (preferred mode)
+DEB_DIR=""             # Temporary extraction directory when using --kernel-deb
+
+MNT_DIR=""             # Temporary mount directory
+LOOP_DEV=""            # Loop device used for the FAT image
+FIT_WORK_DIR=""        # Temporary staging directory for FIT build artefacts
+
+# ITS file used for FIT image generation — must exist in SCRIPT_DIR.
+DEFAULT_ITS_FILE="qcom-next-fitimage.its"
+
+# ---------------------------- Helper Functions -------------------------------
+
+usage() {
+    cat <<EOF
+Usage: $0 (--kernel-deb <kernel.deb> | --dtb-src <path>) [--size <MB>] [--out <file>]
+
+  --kernel-deb, -kernel-deb  Path to Debian kernel package (.deb). DTBs located by probing:
+                             1. <extract>/usr/lib/linux-image-*/        (Debian standard)
+                             2. <extract>/usr/lib/firmware/*/device-tree (Ubuntu, usrmerge)
+                             3. <extract>/lib/firmware/*/device-tree     (Ubuntu, legacy)
+                             Exactly one directory must be found across all search paths.
+
+  --dtb-src,   -dtb-src      Path to DTB source directory
+                             (e.g. arch/arm64/boot/dts/qcom)
+
+  --fit-image, -fit-image    Accepted for backward compatibility; FIT image
+                             mode is the default and only mode (no-op).
+
+  --size,      -size         FAT image size in MB (default: 4)
+
+  --out,       -out          Output image filename (default: dtb.bin)
+
+Notes:
+  - Exactly one of --kernel-deb or --dtb-src must be provided.
+  - The output FAT image contains qclinux_fit.img at its root.
+  - Metadata files (ITS, DTS) are read from: ${SCRIPT_DIR}
+EOF
+    exit 1
+}
+
+require_cmd() {
+    local c="$1"
+    if ! command -v "$c" >/dev/null 2>&1; then
+        echo "[ERROR] Required command not found: $c" >&2
+        exit 1
+    fi
+}
+
+cleanup() {
+    local status=$?
+
+    sync || true
+
+    if [[ -n "${MNT_DIR:-}" && -d "$MNT_DIR" ]]; then
+        if mountpoint -q "$MNT_DIR"; then
+            umount "$MNT_DIR" || true
+        fi
+        rmdir "$MNT_DIR" 2>/dev/null || true
+    fi
+
+    if [[ -n "${LOOP_DEV:-}" ]]; then
+        losetup -d "$LOOP_DEV" || true
+    fi
+
+    if [[ -n "${DEB_DIR:-}" && -d "$DEB_DIR" ]]; then
+        rm -rf "$DEB_DIR" || true
+    fi
+
+    if [[ -n "${FIT_WORK_DIR:-}" && -d "$FIT_WORK_DIR" ]]; then
+        rm -rf "$FIT_WORK_DIR" || true
+    fi
+
+    exit "$status"
+}
+
+trap cleanup EXIT
+
+# ------------------------------ Arg Parsing ----------------------------------
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -dtb-src|--dtb-src)
+            DTB_SRC="${2:-}"
+            shift 2
+            ;;
+        -kernel-deb|--kernel-deb)
+            KERNEL_DEB="${2:-}"
+            shift 2
+            ;;
+        -size|--size)
+            DTB_BIN_SIZE="${2:-}"
+            shift 2
+            ;;
+        -fit-image|--fit-image)
+            # FIT image mode is the default; accepted for backward compatibility.
+            shift 1
+            ;;
+        -out|--out)
+            DTB_BIN="${2:-}"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            usage
+            ;;
+    esac
+done
+
+# ----------------------------- Validation ------------------------------------
+
+# Exactly one source mode must be selected
+if [[ -n "${KERNEL_DEB}" && -n "${DTB_SRC}" ]]; then
+    echo "[ERROR] Provide only one of --kernel-deb or --dtb-src (not both)." >&2
+    usage
+fi
+if [[ -z "${KERNEL_DEB}" && -z "${DTB_SRC}" ]]; then
+    echo "[ERROR] Provide one of --kernel-deb or --dtb-src." >&2
+    usage
+fi
+
+# Validate image size is a positive integer
+if ! [[ "${DTB_BIN_SIZE}" =~ ^[0-9]+$ ]] || (( DTB_BIN_SIZE <= 0 )); then
+    echo "[ERROR] --size must be a positive integer (MB), got '${DTB_BIN_SIZE}'." >&2
+    exit 1
+fi
+
+# Validate that required metadata files are present in the repository
+if [[ ! -f "${SCRIPT_DIR}/qcom-metadata.dts" ]]; then
+    echo "[ERROR] qcom-metadata.dts not found in metadata directory: ${SCRIPT_DIR}" >&2
+    exit 1
+fi
+if [[ ! -f "${SCRIPT_DIR}/${DEFAULT_ITS_FILE}" ]]; then
+    echo "[ERROR] ITS file '${DEFAULT_ITS_FILE}' not found in metadata directory: ${SCRIPT_DIR}" >&2
+    exit 1
+fi
+
+# Command requirements
+require_cmd dd
+require_cmd losetup
+require_cmd mkfs.vfat
+require_cmd mount
+require_cmd umount
+require_cmd mountpoint
+require_cmd mktemp
+require_cmd cp
+require_cmd dtc
+require_cmd mkimage
+
+# ----------------------------- Resolve DTB_SRC -------------------------------
+
+if [[ -n "${KERNEL_DEB}" ]]; then
+    if [[ ! -f "${KERNEL_DEB}" ]]; then
+        echo "[ERROR] Kernel .deb '${KERNEL_DEB}' not found." >&2
+        exit 1
+    fi
+
+    require_cmd dpkg-deb
+
+    DEB_DIR="$(mktemp -d -t kernel-deb-XXXXXX)"
+    echo "[INFO] Extracting kernel .deb to: ${DEB_DIR}"
+    dpkg-deb -R "${KERNEL_DEB}" "${DEB_DIR}"
+
+    # Locate the DTB directory from the extracted .deb.
+    # Probe in order (most to least preferred):
+    #   1. usr/lib/linux-image-*/  — Debian standard install location (direct, no symlink).
+    #                                Works on both Debian and Ubuntu regardless of usrmerge.
+    #   2. usr/lib/firmware/*/device-tree — Ubuntu compat symlink (usrmerge layout).
+    #   3. lib/firmware/*/device-tree     — Ubuntu compat symlink (legacy layout).
+    # Searching the Debian standard path first avoids any dependency on the Ubuntu
+    # compat symlink and is correct on pure Debian systems that never install it.
+    shopt -s nullglob
+    dt_dirs=( "${DEB_DIR}/usr/lib/linux-image-"*/ )
+    if (( ${#dt_dirs[@]} == 0 )); then
+        dt_dirs=( "${DEB_DIR}/usr/lib/firmware"/*/device-tree )
+    fi
+    if (( ${#dt_dirs[@]} == 0 )); then
+        dt_dirs=( "${DEB_DIR}/lib/firmware"/*/device-tree )
+    fi
+    shopt -u nullglob
+
+    if (( ${#dt_dirs[@]} == 0 )); then
+        echo "[ERROR] No DTB directory found under:" >&2
+        echo "        '${DEB_DIR}/usr/lib/linux-image-*/'" >&2
+        echo "        '${DEB_DIR}/usr/lib/firmware/*/device-tree'" >&2
+        echo "        '${DEB_DIR}/lib/firmware/*/device-tree'" >&2
+        exit 1
+    fi
+    if (( ${#dt_dirs[@]} > 1 )); then
+        echo "[ERROR] Multiple DTB directories found; expected exactly one:" >&2
+        for d in "${dt_dirs[@]}"; do
+            echo "        - $d" >&2
+        done
+        exit 1
+    fi
+
+    DTB_SRC="${dt_dirs[0]}"
+    echo "[INFO] Using DTB source directory from .deb payload: ${DTB_SRC}"
+else
+    if [[ ! -d "${DTB_SRC}" ]]; then
+        echo "[ERROR] DTB source directory '${DTB_SRC}' not found." >&2
+        exit 1
+    fi
+    echo "[INFO] Using DTB source directory: ${DTB_SRC}"
+fi
+
+# ==============================================================================
+# FIT DTB Image Build
+# ==============================================================================
+
+echo "[INFO] Building FIT DTB image."
+echo "[INFO] Using metadata from: ${SCRIPT_DIR}"
+
+# -----------------------------------------------------------------------
+# Step 1. Create staging directory and lay out the build tree
+# -----------------------------------------------------------------------
+# mkimage resolves /incbin/ paths relative to the directory it is invoked
+# from, so all artefacts (ITS, compiled metadata DTB, and per-platform
+# DTBs) must be assembled under a single staging tree before mkimage runs.
+FIT_WORK_DIR="$(mktemp -d -t fit-build-XXXXXX)"
+echo "[INFO] FIT build staging directory: ${FIT_WORK_DIR}"
+
+FIT_STAGE="${FIT_WORK_DIR}/fit_image"
+mkdir -p "${FIT_STAGE}"
+
+# Create the directory tree that the ITS /incbin/ paths reference:
+#   arch/arm64/boot/dts/qcom/<platform>.dtb
+DTB_STAGE="${FIT_STAGE}/arch/arm64/boot/dts/qcom"
+mkdir -p "${DTB_STAGE}"
+
+# Copy DTBs from the resolved DTB source directory.
+# DTBs may be nested under vendor subdirectories (e.g. qcom/), so use
+# find -L (follow symlinks) rather than a flat glob to collect them all
+# into the staging dir flat — the ITS file references them by basename
+# under arch/arm64/boot/dts/qcom/.
+echo "[INFO] Copying DTBs from ${DTB_SRC} ..."
+dtb_count=0
+while IFS= read -r dtb; do
+    cp -p "${dtb}" "${DTB_STAGE}/"
+    (( dtb_count++ )) || true
+done < <(find -L "${DTB_SRC}" \( -name '*.dtb' -o -name '*.dtbo' \) -type f)
+
+if (( dtb_count == 0 )); then
+    echo "[ERROR] No DTB files found under ${DTB_SRC}" >&2
+    echo "        Verify the kernel package was built with DTB support" >&2
+    echo "        and that usr/lib/linux-image-*/ is present in the package." >&2
+    exit 1
+fi
+echo "[INFO] Staged ${dtb_count} DTB file(s) to ${DTB_STAGE}"
+echo "[INFO] Staged DTBs:"
+ls "${DTB_STAGE}"/*.dtb 2>/dev/null | xargs -n1 basename | sort | sed 's/^/        /'
+
+# -----------------------------------------------------------------------
+# Step 2. Compile qcom-metadata.dts → qcom-metadata.dtb
+# -----------------------------------------------------------------------
+echo "[INFO] Compiling qcom-metadata.dts..."
+dtc -I dts -O dtb \
+    -o "${FIT_STAGE}/qcom-metadata.dtb" \
+    "${SCRIPT_DIR}/qcom-metadata.dts"
+echo "[INFO] qcom-metadata.dtb generated:"
+ls -lh "${FIT_STAGE}/qcom-metadata.dtb"
+
+# -----------------------------------------------------------------------
+# Step 3. Copy ITS file into the staging directory
+# -----------------------------------------------------------------------
+cp "${SCRIPT_DIR}/${DEFAULT_ITS_FILE}" "${FIT_STAGE}/${DEFAULT_ITS_FILE}"
+
+# -----------------------------------------------------------------------
+# Step 4. Generate qclinux_fit.img via mkimage
+# -----------------------------------------------------------------------
+# mkimage is invoked from FIT_STAGE so that all /incbin/ relative paths
+# in the ITS file resolve correctly.
+#
+# Output filename MUST be qclinux_fit.img — hardcoded in UEFI firmware:
+#   #define FIT_BINARY_FILE    L"\\qclinux_fit.img"
+#   #define COMBINED_DTB_FILE  L"\\combined-dtb.dtb"
+#   #define SECONDARY_DTB_FILE L"\\secondary-dtb.dtb"
+mkdir -p "${FIT_STAGE}/out"
+echo "[INFO] Running mkimage to generate qclinux_fit.img..."
+(
+    cd "${FIT_STAGE}"
+    mkimage -f "${DEFAULT_ITS_FILE}" out/qclinux_fit.img -E -B 8
+)
+echo "[INFO] qclinux_fit.img generated:"
+ls -lh "${FIT_STAGE}/out/qclinux_fit.img"
+file "${FIT_STAGE}/out/qclinux_fit.img"
+
+# -----------------------------------------------------------------------
+# Step 5. Pack qclinux_fit.img into a FAT image
+# -----------------------------------------------------------------------
+echo "[INFO] Creating FAT image '${DTB_BIN}' (${DTB_BIN_SIZE} MB)..."
+dd if=/dev/zero of="${DTB_BIN}" bs=1M count="${DTB_BIN_SIZE}" status=progress
+
+LOOP_DEV="$(losetup --show -fP "${DTB_BIN}")"
+echo "[INFO] Using loop device: ${LOOP_DEV}"
+
+MNT_DIR="$(mktemp -d -t dtb-mnt-XXXXXX)"
+
+echo "[INFO] Formatting ${LOOP_DEV} as FAT with 4 KiB sector size..."
+mkfs.vfat -S 4096 "${LOOP_DEV}" >/dev/null
+
+echo "[INFO] Mounting ${LOOP_DEV} at ${MNT_DIR}..."
+mount "${LOOP_DEV}" "${MNT_DIR}"
+
+cp "${FIT_STAGE}/out/qclinux_fit.img" "${MNT_DIR}/"
+echo "[INFO] Deployed qclinux_fit.img into FAT image."
+echo "[INFO] Files in image:"
+ls -lh "${MNT_DIR}"
+
+# Normal exit (cleanup will still run, but now everything should succeed).
+exit 0
