@@ -296,5 +296,9 @@
 			compatible = "qcom,qcs8275-iot-subtype3";
 			fdt = "fdt-monaco-evk.dtb", "fdt-monaco-evk-ifp-mezzanine.dtbo";
 		};
+		conf-42 {
+			compatible = "qcom,purwa-evk-el2kvm";
+			fdt = "fdt-purwa-iot-evk.dtb", "fdt-x1-el2.dtbo";
+		};
 	};
 };
