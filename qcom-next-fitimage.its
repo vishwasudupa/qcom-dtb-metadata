@@ -234,7 +234,7 @@
 		};
 		conf-24 {
 			compatible = "qcom,qcs9075-iot-el2kvm";
-			fdt = "fdt-lemans-evk.dtb", "fdt-lemans-evk-camera-csi1-imx577.dtbo" "fdt-lemans-el2.dtbo";
+			fdt = "fdt-lemans-evk.dtb", "fdt-lemans-evk-camera-csi1-imx577.dtbo", "fdt-lemans-el2.dtbo";
 		};
 		conf-25 {
 			compatible = "qcom,qcs9100-qam-el2kvm";
@@ -274,7 +274,7 @@
 		};
 		conf-34 {
 			compatible = "qcom,qcs8275-iot-el2kvm";
-			fdt = "fdt-monaco-evk.dtb", "fdt-monaco-evk-camera-imx577.dtbo" "fdt-monaco-el2.dtbo";
+			fdt = "fdt-monaco-evk.dtb", "fdt-monaco-evk-camera-imx577.dtbo", "fdt-monaco-el2.dtbo";
 		};
 		conf-35 {
 			compatible = "qcom,qcs8275-iot-camx-el2kvm";
