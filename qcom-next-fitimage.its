@@ -294,7 +294,7 @@
 		};
 		conf-39 {
 			compatible = "qcom,hamoa-evk-el2kvm";
-			fdt = "fdt-hamoa-iot-evk.dtb", "fdt-x1-el2.dtbo";
+			fdt = "fdt-hamoa-iot-evk.dtb", "fdt-hamoa-iot-evk-camera-imx577.dtbo", "fdt-x1-el2.dtbo";
 		};
 		conf-40 {
 			compatible = "qcom,qcs9075-iot-subtype1";
