@@ -1,0 +1,43 @@
+name: Build DTB Image
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-dtb-image:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            device-tree-compiler \
+            u-boot-tools \
+            mtools \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            bc bison flex python3
+
+      - name: Make scripts executable
+        run: chmod +x ./build-dtb-image.sh ./build-qcom-dtb-image.sh
+
+      - name: Build DTB image from qcom-next kernel
+        run: ./build-qcom-dtb-image.sh --out dtb.bin
+
+      - name: Verify dtb.bin was created
+        run: |
+          if [[ ! -f dtb.bin ]]; then
+            echo "[ERROR] dtb.bin was not created — build failed." >&2
+            exit 1
+          fi
+          echo "[INFO] dtb.bin created successfully."
+          ls -lh dtb.bin
