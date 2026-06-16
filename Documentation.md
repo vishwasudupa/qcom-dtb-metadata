@@ -45,9 +45,13 @@ If any new suffix is introduced, it must be added to metadata (pls refer qcom-dt
 
 ---
  
-#### qcom-fitimage.its
+#### qcom-fitimage.its & qcom-next-fitimage.its
 
-Refer: https://github.com/qualcomm-linux/qcom-dtb-metadata/blob/main/qcom-fitimage.its
+Refer: 
+qcom-fitimage.its: https://github.com/qualcomm-linux/qcom-dtb-metadata/blob/main/qcom-fitimage.its
+qcom-next-fitimage.its: https://github.com/qualcomm-linux/qcom-dtb-metadata/blob/main/qcom-next-fitimage.its
+
+The qcom-fitimage.its file is the base configuration used to generate FIT images containing only the core kernel Device Trees (DT), excluding techpack and runtime overlays. For workflows requiring full integration, qcom-next-fitimage.its has been provided to include all techpack Device Trees.
  
 ---
  
