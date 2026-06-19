@@ -363,11 +363,11 @@
 		};
     conf-49 {
 			compatible = "qcom,hamoa-evk-camx-el2kvm";
-			fdt = "fdt-hamoa-iot-evk.dtb", "fdt-x1-el2.dtbo", "fdt-hamoa-evk-camx.dtbo", "fdt-hamoa-camx-el2.dtbo";
+			fdt = "fdt-hamoa-iot-evk.dtb", "fdt-hamoa-camx-el2.dtbo", "fdt-x1-el2.dtbo", "fdt-hamoa-evk-camx.dtbo";
 		};
 		conf-50 {
 			compatible = "qcom,purwa-evk-camx-el2kvm";
-			fdt = "fdt-purwa-iot-evk.dtb", "fdt-x1-el2.dtbo", "fdt-purwa-evk-camx.dtbo", "fdt-purwa-camx-el2.dtbo";
+			fdt = "fdt-purwa-iot-evk.dtb", "fdt-purwa-evk-camx.dtbo", "fdt-x1-el2.dtbo", "fdt-purwa-camx-el2.dtbo";
 		};
 	};
 };
